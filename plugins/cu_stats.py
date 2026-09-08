@@ -5,9 +5,11 @@
 """Wiki 统计：顶部配置、只读查询、结果格式化和 QQ 命令适配。"""
 
 import logging
+import re
 from dataclasses import dataclass
 
 from curl_cffi import requests as curl_requests
+from curl_cffi.requests.exceptions import Timeout
 
 from plugins.base_plugin import BasePlugin
 from reply import Reply
@@ -24,6 +26,45 @@ SHORT_PAGE_LIMIT = 500  # API 单批上限为 500；不是随机样本，也不�
 logger = logging.getLogger("plugin.wiki_stats")
 
 
+class WikiApiError(Exception):
+    """仅携带可安全展示的分类信息，不携带响应、Cookie 或请求参数。"""
+
+    def __init__(self, kind: str, message: str, *, code: str = "", status: int | None = None):
+        super().__init__(message)
+        self.kind = kind
+        self.code = code if re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", code) else ""
+        self.status = status
+
+
+def _api_error(error: object, status: int) -> WikiApiError:
+    code = error.get("code", "") if isinstance(error, dict) else ""
+    code = code if isinstance(code, str) else ""
+    if code in {"permissiondenied", "rcpermissiondenied", "readapidenied"}:
+        return WikiApiError(
+            "permission", "当前身份无权执行该查询或站点限制了此能力", code=code, status=status
+        )
+    if code in {"assertuserfailed", "assertnameduserfailed", "notloggedin"}:
+        return WikiApiError(
+            "authentication", "Wiki 登录身份已失效或不匹配", code=code, status=status
+        )
+    if code in {
+        "unknown_list",
+        "unknown_meta",
+        "unknown_action",
+        "badvalue",
+        "paramvalidator-badvalue",
+    }:
+        return WikiApiError("unsupported", "API 模块或参数不受支持", code=code, status=status)
+    return WikiApiError("api", "Wiki API 拒绝了请求，具体原因尚未确认", code=code, status=status)
+
+
+def _query(data: dict) -> dict:
+    query = data.get("query")
+    if not isinstance(query, dict):
+        raise WikiApiError("response", "Wiki API 响应缺少有效 query 对象")
+    return query
+
+
 @dataclass(frozen=True)
 class WikiStats:
     """一次查询的结果，不携带 QQ 用户或回复对象。"""
@@ -32,9 +73,10 @@ class WikiStats:
     short_pages: int | None
     short_has_more: bool = False
     short_cached: bool = False
+    short_error: WikiApiError | None = None
 
 
-async def _api_request(session: curl_requests.AsyncSession, **params) -> dict | None:
+async def _api_request(session: curl_requests.AsyncSession, **params) -> dict:
     """返回 API 响应，保留 continuation；HTTP 成功但 API 报错也算失败。"""
     try:
         response = await session.post(
@@ -44,36 +86,47 @@ async def _api_request(session: curl_requests.AsyncSession, **params) -> dict | 
             allow_redirects=False,
         )
         if response.status_code != 200:
-            logger.warning("Wiki API HTTP %s", response.status_code)
-            return None
-    except curl_requests.RequestsError as exc:
-        logger.warning("Wiki API 请求失败：%s", exc)
-        return None
+            raise WikiApiError(
+                "http",
+                f"Wiki HTTP 访问异常（{response.status_code}），不等同于账号权限不足",
+                status=response.status_code,
+            )
+    except Timeout:
+        raise WikiApiError("timeout", "Wiki 请求超时") from None
+    except curl_requests.RequestsError:
+        raise WikiApiError("network", "无法连接 Wiki，请检查网络") from None
     try:
         data = response.json()
     except ValueError:
-        logger.warning("Wiki API 返回非 JSON，HTTP %s；可能是验证页面", response.status_code)
-        return None
+        raise WikiApiError(
+            "non_json", "Wiki 返回非 JSON，可能遇到访问验证", status=response.status_code
+        ) from None
 
-    if not isinstance(data, dict) or "error" in data or "errors" in data:
-        logger.warning("Wiki API 返回错误或非对象 JSON")
-        return None
-    query = data.get("query")
-    if not isinstance(query, dict):
-        logger.warning("Wiki API 缺少 query 对象")
-        return None
+    if not isinstance(data, dict):
+        raise WikiApiError("response", "Wiki API 返回的 JSON 不是对象")
+    if "error" in data:
+        raise _api_error(data["error"], response.status_code)
+    if "errors" in data:
+        errors = data["errors"]
+        raise _api_error(
+            errors[0] if isinstance(errors, list) and errors else None, response.status_code
+        )
+    # 当前请求没有预期警告；宁可标为不可确认，也不能把忽略了过滤条件的结果当作统计。
+    if data.get("warnings"):
+        raise WikiApiError(
+            "warning", "API 返回警告，无法确认查询条件是否生效", status=response.status_code
+        )
     return data
 
 
-async def fetch_wiki_stats() -> WikiStats | None:
+async def fetch_wiki_stats() -> WikiStats:
     """一次命令共用一个会话；基础统计失败终止，短页面失败降级。"""
     # Cookie Jar 贯穿本次统计任务，退出时关闭；指纹模拟不会执行 JS challenge。
     async with curl_requests.AsyncSession(impersonate=CHROME_FINGERPRINT) as session:
         data = await _api_request(session, meta="siteinfo", siprop="statistics")
-        statistics = data["query"].get("statistics") if data is not None else None
+        statistics = _query(data).get("statistics")
         if not isinstance(statistics, dict) or not statistics:
-            logger.warning("Wiki API 缺少有效的 statistics 对象")
-            return None
+            raise WikiApiError("response", "Wiki API 缺少有效的基础统计")
         # 缺失或异常字段不能显示成 0，以免把未知数据当作真实统计。
         statistics = {
             key: value
@@ -83,26 +136,26 @@ async def fetch_wiki_stats() -> WikiStats | None:
             and value >= 0
         }
         if not statistics:
-            return None
+            raise WikiApiError("response", "Wiki API 基础统计没有有效字段")
 
-        # ponytail: 仅取首批，超过 500 条时标注未读完；需要精确列表数再增加有界分页。
-        short_data = await _api_request(
-            session,
-            list="querypage",
-            qppage="Shortpages",
-            qplimit=SHORT_PAGE_LIMIT,
-        )
-        if short_data is None:
-            return WikiStats(statistics, None)
-        short = short_data["query"].get("querypage")
-        if not isinstance(short, dict) or not isinstance(short.get("results"), list):
-            return WikiStats(statistics, None)
-        results = short["results"]
-        if any(
-            not isinstance(page, dict) or not isinstance(page.get("title"), str) for page in results
-        ):
-            logger.warning("Wiki API 短页面列表条目无效")
-            return WikiStats(statistics, None)
+        try:
+            short_data = await _api_request(
+                session,
+                list="querypage",
+                qppage="Shortpages",
+                qplimit=SHORT_PAGE_LIMIT,
+            )
+            short = _query(short_data).get("querypage")
+            if not isinstance(short, dict) or not isinstance(short.get("results"), list):
+                raise WikiApiError("response", "Wiki API 短页面列表结构无效")
+            results = short["results"]
+            if any(
+                not isinstance(page, dict) or not isinstance(page.get("title"), str)
+                for page in results
+            ):
+                raise WikiApiError("response", "Wiki API 短页面列表条目无效")
+        except WikiApiError as error:
+            return WikiStats(statistics, None, short_error=error)
         return WikiStats(
             statistics,
             len(results),
@@ -114,7 +167,7 @@ async def fetch_wiki_stats() -> WikiStats | None:
 def format_wiki_stats(stats: WikiStats) -> str:
     """展示 API 的实际口径；Shortpages 列表不能当作自定义阈值的全站统计。"""
     if stats.short_pages is None:
-        short_text = "获取失败"
+        short_text = f"不可用：{stats.short_error or '原因尚未确认'}"
     else:
         short_text = f"已读取 {stats.short_pages} 条"
         if stats.short_has_more:
@@ -152,9 +205,13 @@ class WikiStatsPlugin(BasePlugin):
         if params and params.strip():
             return Reply(text="请使用 /wiki统计；数据源由维护者在源码顶部配置。")
 
-        stats = await fetch_wiki_stats()
-        if stats is None:
-            return Reply(text="❌ 无法获取 Wiki 统计，请检查 API 地址、网络或站点访问限制。")
+        try:
+            stats = await fetch_wiki_stats()
+        except WikiApiError as error:
+            logger.warning(
+                "Wiki 查询失败 kind=%s code=%s status=%s", error.kind, error.code, error.status
+            )
+            return Reply(text=f"❌ 无法获取 Wiki 统计：{error}")
 
         keyboard = None
         # 当前框架可能取不到群用户 ID；此时省略按钮，避免生成 [None] 权限列表。

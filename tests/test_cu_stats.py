@@ -52,16 +52,31 @@ class WikiStatsCheck(unittest.IsolatedAsyncioTestCase):
             session.post.side_effect = [response(base), response({"error": {"code": "unknown_list"}})]
             self.assertIsNone((await cu_stats.fetch_wiki_stats()).short_pages)
             session.post.side_effect = [response({"query": {"statistics": {}}})]
-            self.assertIsNone(await cu_stats.fetch_wiki_stats())
+            with self.assertRaises(cu_stats.WikiApiError):
+                await cu_stats.fetch_wiki_stats()
 
-        for bad_response in (
-            response({}, 403), response({"errors": []}), response([]),
-            response({"query": None}), Mock(status_code=200, json=Mock(side_effect=ValueError)),
+        for bad_response, kind in (
+            (response({}, 403), "http"),
+            (response({"errors": []}), "api"),
+            (response([]), "response"),
+            (response({"warnings": {"recentchanges": {"*": "ignored"}}}), "warning"),
+            (response({"error": {"code": "permissiondenied"}}), "permission"),
+            (Mock(status_code=200, json=Mock(side_effect=ValueError)), "non_json"),
         ):
             session.post = AsyncMock(return_value=bad_response)
-            self.assertIsNone(await cu_stats._api_request(session, meta="siteinfo"))
-        session.post = AsyncMock(side_effect=cu_stats.curl_requests.RequestsError("timeout"))
-        self.assertIsNone(await cu_stats._api_request(session, meta="siteinfo"))
+            with self.assertRaises(cu_stats.WikiApiError) as caught:
+                await cu_stats._api_request(session, meta="siteinfo")
+            self.assertEqual(caught.exception.kind, kind)
+        session.post = AsyncMock(side_effect=cu_stats.curl_requests.RequestsError("secret"))
+        with self.assertRaises(cu_stats.WikiApiError) as caught:
+            await cu_stats._api_request(session, meta="siteinfo")
+        self.assertEqual(caught.exception.kind, "network")
+        self.assertNotIn("secret", str(caught.exception))
+        with self.assertRaises(cu_stats.WikiApiError):
+            cu_stats._query({"query": None})
+        # 登录响应不含 query，结构检查必须属于调用方。
+        session.post = AsyncMock(return_value=response({"login": {"result": "Success"}}))
+        self.assertIn("login", await cu_stats._api_request(session, action="login"))
 
 
 if __name__ == "__main__":
