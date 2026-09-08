@@ -29,6 +29,13 @@ CHROME_FINGERPRINT = "chrome131"
 REQUEST_TIMEOUT = 15  # 单请求超时秒数，必须大于 0；不自动重试。
 TASK_TIMEOUT = 60  # 整次网络任务秒数，必须大于 0；耗尽后保留已取得的数据。
 SHORT_PAGE_LIMIT = 500  # API 单批上限为 500；不是随机样本，也不用于估算全站总数。
+# 巡查只取首批：整数 1–500。调小可减少返回数据量；调大不会自动分页。
+# 存在 continuation 时，两项巡查数量都只代表已读部分，不是整个保留窗口的总数。
+PATROL_LIMIT = 500
+# None 表示所有当前身份可见的命名空间；非空整数元组指定范围，如 (0,) 仅主空间。
+# 值须为目标 Wiki 的非负命名空间编号；可用 API siteinfo/namespaces 手工核对。
+# 该配置只影响巡查，不改变基础统计或 Shortpages。未知编号会由 API 校验并明确降级。
+PATROL_NAMESPACES: tuple[int, ...] | None = None
 
 logger = logging.getLogger("plugin.wiki_stats")
 
@@ -82,6 +89,15 @@ class WikiIdentity:
 
 
 @dataclass(frozen=True)
+class PatrolStats:
+    """RecentChanges 同一首批中的更改条数及其中的新建记录条数。"""
+
+    changes: int
+    new_pages: int
+    has_more: bool
+
+
+@dataclass(frozen=True)
 class WikiStats:
     """一次查询的结果，不携带 QQ 用户或回复对象。"""
 
@@ -92,10 +108,17 @@ class WikiStats:
     short_error: WikiApiError | None = None
     identity: WikiIdentity = WikiIdentity()
     auth_error: WikiApiError | None = None
+    patrol: PatrolStats | None = None
+    patrol_error: WikiApiError | None = None
+    patrol_namespaces: tuple[int, ...] | None = None
 
 
 async def _api_request(
-    session: curl_requests.AsyncSession, *, deadline: float | None = None, **params
+    session: curl_requests.AsyncSession,
+    *,
+    deadline: float | None = None,
+    allow_userinfo_warning: bool = False,
+    **params,
 ) -> dict:
     """返回 API 响应，保留 continuation；HTTP 成功但 API 报错也算失败。"""
     remaining = REQUEST_TIMEOUT if deadline is None else deadline - monotonic()
@@ -138,8 +161,11 @@ async def _api_request(
         raise _api_error(
             errors[0] if isinstance(errors, list) and errors else None, response.status_code
         )
-    # 当前请求没有预期警告；宁可标为不可确认，也不能把忽略了过滤条件的结果当作统计。
-    if data.get("warnings"):
+    # 合并查询的 userinfo 警告只使身份未知；其他警告可能改变统计语义，不能忽略。
+    warnings = data.get("warnings")
+    if warnings and not (
+        allow_userinfo_warning and isinstance(warnings, dict) and set(warnings) == {"userinfo"}
+    ):
         raise WikiApiError(
             "warning", "API 返回警告，无法确认查询条件是否生效", status=response.status_code
         )
@@ -241,7 +267,7 @@ async def _login(
         client = data.get("clientlogin")
         if not isinstance(client, dict):
             raise WikiApiError("response", "Wiki clientlogin 响应结构无效")
-    if client.get("status") in {"UI", "REDIRECT", "RESTART"}:
+    if client.get("status") in ("UI", "REDIRECT", "RESTART"):
         raise WikiApiError("interaction", "Wiki 登录需要人工验证，请先在站点处理")
     if client.get("status") != "PASS":
         raise WikiApiError("authentication", "Wiki 登录被拒绝，请检查凭据、账号状态或站点登录限制")
@@ -251,8 +277,70 @@ async def _login(
     return name
 
 
+def _patrol_params() -> dict:
+    if type(PATROL_LIMIT) is not int or not 1 <= PATROL_LIMIT <= 500:
+        raise WikiApiError("configuration", "PATROL_LIMIT 必须是 1–500 的整数；本插件不自动分页")
+    params = {
+        "list": "recentchanges",
+        "rcshow": "!patrolled",
+        "rctype": "edit|new",
+        "rcprop": "ids|flags",
+        "rclimit": PATROL_LIMIT,
+    }
+    if PATROL_NAMESPACES is not None:
+        if (
+            not isinstance(PATROL_NAMESPACES, tuple)
+            or not PATROL_NAMESPACES
+            or any(type(ns) is not int or ns < 0 for ns in PATROL_NAMESPACES)
+        ):
+            raise WikiApiError(
+                "configuration", "PATROL_NAMESPACES 必须为 None 或非空的非负整数元组"
+            )
+        params["rcnamespace"] = "|".join(str(ns) for ns in PATROL_NAMESPACES)
+    return params
+
+
+async def _fetch_patrol(
+    session: curl_requests.AsyncSession, stats: WikiStats, deadline: float, guards: dict
+) -> PatrolStats:
+    params = _patrol_params()
+    if stats.auth_error is not None:
+        raise WikiApiError("authentication", "Wiki 登录未完成，本次未查询巡查数据")
+    if stats.short_error is not None and stats.short_error.kind == "authentication":
+        raise WikiApiError("authentication", "Wiki 登录身份已失效，本次未继续查询巡查数据")
+    identity = stats.identity
+    if identity.state == "unknown" or identity.rights is None:
+        raise WikiApiError("unknown", "无法确认本次身份或巡查权限")
+    if not identity.rights.intersection({"patrol", "patrolmarks"}):
+        label = "匿名身份" if identity.state == "anonymous" else "Wiki 账号"
+        raise WikiApiError("permission", f"当前{label}缺少 patrol 或 patrolmarks 权限")
+    data = await _api_request(session, deadline=deadline, **params, **guards)
+    rows = _query(data).get("recentchanges")
+    if not isinstance(rows, list) or len(rows) > PATROL_LIMIT:
+        raise WikiApiError("response", "Wiki API 巡查列表结构或条数无效")
+    seen = set()
+    new_pages = 0
+    for row in rows:
+        if (
+            not isinstance(row, dict)
+            or row.get("type") not in ("edit", "new")
+            or type(row.get("rcid")) is not int
+            or row["rcid"] <= 0
+            or type(row.get("ns")) is not int
+            or row["ns"] < 0
+        ):
+            raise WikiApiError("response", "Wiki API 巡查列表包含无效记录")
+        if row["rcid"] in seen or (
+            PATROL_NAMESPACES is not None and row["ns"] not in PATROL_NAMESPACES
+        ):
+            raise WikiApiError("response", "Wiki API 巡查列表有重复记录或命名空间不符合筛选条件")
+        seen.add(row["rcid"])
+        new_pages += row["type"] == "new"
+    return PatrolStats(len(rows), new_pages, "continue" in data or "query-continue" in data)
+
+
 async def fetch_wiki_stats() -> WikiStats:
-    """一次命令共用一个会话；基础统计失败终止，短页面失败降级。"""
+    """一次命令共用一个会话；基础统计失败终止，短页面和巡查独立降级。"""
     if any(
         type(value) not in {int, float} or not 0 < value < float("inf")
         for value in (REQUEST_TIMEOUT, TASK_TIMEOUT)
@@ -261,7 +349,7 @@ async def fetch_wiki_stats() -> WikiStats:
     username, password = _credentials()
     deadline = monotonic() + TASK_TIMEOUT
     auth_error = None
-    guards = {}
+    guards: dict = {}
     # Cookie Jar 贯穿登录和本次查询；不在初始化时联网，不跨命令保存状态。
     async with curl_requests.AsyncSession(impersonate=CHROME_FINGERPRINT) as session:
         if username or password:
@@ -278,11 +366,16 @@ async def fetch_wiki_stats() -> WikiStats:
             meta="siteinfo|userinfo",
             siprop="statistics",
             uiprop="rights",
+            allow_userinfo_warning=True,
             **guards,
         )
         query = _query(data)
-        identity = _identity(query)
-        if guards and (identity.state != "authenticated" or identity.name != guards["assertuser"]):
+        identity = WikiIdentity() if data.get("warnings") else _identity(query)
+        if (
+            guards
+            and identity.state != "unknown"
+            and (identity.state != "authenticated" or identity.name != guards["assertuser"])
+        ):
             raise WikiApiError("authentication", "无法确认 Wiki 登录身份，已停止本次查询")
         statistics = query.get("statistics")
         if not isinstance(statistics, dict) or not statistics:
@@ -298,7 +391,13 @@ async def fetch_wiki_stats() -> WikiStats:
         if not statistics:
             raise WikiApiError("response", "Wiki API 基础统计没有有效字段")
 
-        stats = WikiStats(statistics, None, identity=identity, auth_error=auth_error)
+        stats = WikiStats(
+            statistics,
+            None,
+            identity=identity,
+            auth_error=auth_error,
+            patrol_namespaces=PATROL_NAMESPACES,
+        )
         try:
             short_data = await _api_request(
                 session,
@@ -318,13 +417,18 @@ async def fetch_wiki_stats() -> WikiStats:
             ):
                 raise WikiApiError("response", "Wiki API 短页面列表条目无效")
         except WikiApiError as error:
-            return replace(stats, short_error=error)
-        return replace(
-            stats,
-            short_pages=len(results),
-            short_has_more="continue" in short_data or "query-continue" in short_data,
-            short_cached="cached" in short,
-        )
+            stats = replace(stats, short_error=error)
+        else:
+            stats = replace(
+                stats,
+                short_pages=len(results),
+                short_has_more="continue" in short_data or "query-continue" in short_data,
+                short_cached="cached" in short,
+            )
+        try:
+            return replace(stats, patrol=await _fetch_patrol(session, stats, deadline, guards))
+        except WikiApiError as error:
+            return replace(stats, patrol_error=error)
 
 
 def format_wiki_stats(stats: WikiStats) -> str:
@@ -338,6 +442,20 @@ def format_wiki_stats(stats: WikiStats) -> str:
         if stats.short_cached:
             short_text += "（站点缓存）"
     base = stats.statistics
+    if stats.patrol is None:
+        patrol_text = f"不可用：{stats.patrol_error or '原因尚未确认'}"
+    else:
+        patrol_text = f"已读取 {stats.patrol.changes} 条，其中新建 {stats.patrol.new_pages} 条"
+        patrol_text += (
+            "（还有后续，本次未继续读取；其中新建也仅限已读部分）"
+            if stats.patrol.has_more
+            else "（本次列表已读完）"
+        )
+    scope = (
+        "所有可见命名空间"
+        if stats.patrol_namespaces is None
+        else f"命名空间 {stats.patrol_namespaces}"
+    )
     identity_text = {"anonymous": "匿名", "authenticated": "已认证", "unknown": "未知"}[
         stats.identity.state
     ]
@@ -351,10 +469,10 @@ def format_wiki_stats(stats: WikiStats) -> str:
         f"• **总编辑数**：{base.get('edits', '无法获取')}\n"
         f"• **注册用户**：{base.get('users', '无法获取')}\n"
         f"• **活跃用户**：{base.get('activeusers', '无法获取')}\n"
-        # TODO: 确认目标站巡查机制和权限；FlaggedRevs 审核不等于 MediaWiki 巡查。
-        f"• **待巡查页面**：暂不可用（统计口径待确认）\n"
+        f"• **待巡查更改**：{patrol_text}\n"
         f"• **短页面列表**：{short_text}\n\n"
         f"> 短页面按站点 Shortpages 列表展示，不代表全站短页面总数。\n"
+        f"> 巡查范围：{scope}；仅当前身份可见的 RecentChanges 保留窗口内编辑／新建记录，不是历史累计。\n"
         f"{login_text}\n"
         f"> 数据来源：{DEFAULT_API_URL}"
     )
@@ -383,6 +501,12 @@ class WikiStatsPlugin(BasePlugin):
                 "Wiki 查询失败 kind=%s code=%s status=%s", error.kind, error.code, error.status
             )
             return Reply(text=f"❌ 无法获取 Wiki 统计：{error}")
+
+        for error in (stats.auth_error, stats.short_error, stats.patrol_error):
+            if error is not None:
+                logger.warning(
+                    "Wiki 功能降级 kind=%s code=%s status=%s", error.kind, error.code, error.status
+                )
 
         keyboard = None
         # 当前框架可能取不到群用户 ID；此时省略按钮，避免生成 [None] 权限列表。

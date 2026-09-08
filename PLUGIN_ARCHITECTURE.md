@@ -61,14 +61,14 @@ Cookie 完全由 Session 的 Cookie Jar 保存和复用，不手工解析、不�
 | `REQUEST_TIMEOUT` | 每次请求 15 秒 |
 | `SHORT_PAGE_LIMIT` | 500 条，调整范围为 1–500 |
 
-本阶段公开查询两次请求；登录最多增加四次：token、login、指定原因下的 clientlogin 回退、一次可跳过密码重置的继续请求。其他交互和 NeedToken 不重试。登录后基础统计合并 userinfo/rights，以规范用户名断言身份；后续认证查询继续携带 assert=user/assertuser。登录失败停止认证流程并明确降级到公开统计，不声称认证成功。请求串行、不跟随重定向，单请求默认 15 秒、整次网络任务默认 60 秒；预算耗尽停止新增请求并保留已读结果。
+公开基础统计和 Shortpages 共两次请求；具备巡查权限时增加一次 RecentChanges 请求。登录最多增加四次：token、login、指定原因下的 clientlogin 回退、一次可跳过密码重置的继续请求。其他交互和 NeedToken 不重试。登录后基础统计合并 userinfo/rights，以规范用户名断言身份；后续认证查询继续携带 assert=user/assertuser。登录失败停止认证流程并明确降级到公开统计，不声称认证成功。请求串行、不跟随重定向，最多七次；单请求默认 15 秒、整次网络任务默认 60 秒；预算耗尽停止新增请求并保留已读结果。
 
 ## 指标与失败行为
 
 | 输出 | 来源与口径 |
 | --- | --- |
 | 总页面数、总编辑数、注册用户、活跃用户 | `siteinfo.statistics` 对应字段；缺失或无效值显示“无法获取”，不伪造为 0 |
-| 待巡查页面 | 暂不可用，目标站巡查机制、权限和统计口径尚待确认 |
+| 待巡查更改及其中新建 | 原生 Patrol：recentchanges 首批，rcshow=!patrolled、rctype=edit\|new；其中新建是该批新建记录条数，受当前可见保留窗口和读取上限约束 |
 | 短页面列表 | `querypage=Shortpages` 首批返回条数；有 continuation 时显示“列表还有后续”，有 `cached` 标记时显示“站点缓存” |
 
 短页面数量是**本次读取的列表条数**，不是“170 字节以下的页面总数”，不是随机样本，也不用于推算全站。即使没有 continuation，也仅代表 API 返回列表读完；站点查询页可能有缓存或结果总数限制。[MediaWiki Querypage 文档](https://www.mediawiki.org/wiki/API:Querypage)
@@ -81,6 +81,7 @@ Cookie 完全由 Session 的 Cookie Jar 保存和复用，不手工解析、不�
 
 - 基础统计整体不可用：返回错误文本，终止后续请求。
 - 短页面不可用：保留基础统计，该项显示获取失败。
+- 巡查与 Shortpages 独立降级：缺权、身份未知或登录失败时跳过巡查；认证身份失效后不再发送巡查请求。身份警告仅使身份未知，其他 API 警告保守处理，不能把忽略了过滤条件的响应当作有效计数。
 - HTTP 200 中的 `error` / `errors`、无效 JSON 和缺失必要结构都不会当作成功。
 - 请求层以 `WikiApiError` 保留安全的分类、错误码和 HTTP 状态；具体响应结构由查询方校验，允许后续接入不含 `query` 的登录响应。API 警告保守降级，避免忽略过滤条件后误计数。不会记录完整响应或底层异常中的敏感内容。
 - 刷新按钮已补齐 `button_id`；没有调用者 ID 时省略按钮，避免生成 `[None]` 权限列表。
@@ -138,6 +139,6 @@ Cookie 完全由 Session 的 Cookie Jar 保存和复用，不手工解析、不�
 uv run python -m unittest discover -s tests
 ```
 
-下一步按实际需要确认待巡查定义，或实现明确的短页面字节阈值查询。真实 QQ 发送、登录访问、长期网络稳定性和全量分页仍不在此次验证范围。
+巡查定义已落实为当前 RecentChanges 保留窗口内的未巡查编辑／新建记录；下一步优先完成真实 Wiki 登录与巡查成功路径、QQ 发送验收。自定义短页面字节阈值和全量分页未实现。
 
 日后更换 QQ 框架时，主要替换 `WikiStatsPlugin`、`Reply` 和按钮构造。网络查询与格式化已不使用 QQ 对象，暂不必为了可能的迁移拆分更多文件。

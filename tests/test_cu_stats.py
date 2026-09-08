@@ -193,5 +193,100 @@ class WikiCookieCheck(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all("identity=confirmed" in cookie for cookie in cookies[2:]))
 
 
+class WikiPatrolCheck(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        for target, value in (("_credentials", ("", "")), ("PATROL_LIMIT", 500), ("PATROL_NAMESPACES", None)):
+            patcher = patch.object(cu_stats, target, return_value=value) if target == "_credentials" else patch.object(cu_stats, target, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.session = AsyncMock()
+        factory = patch.object(cu_stats.curl_requests, "AsyncSession")
+        factory.start().return_value.__aenter__.return_value = self.session
+        self.addCleanup(factory.stop)
+
+    base = {"query": {"statistics": {"pages": 12}, "userinfo": {"id": 0, "anon": "", "rights": ["read", "patrolmarks"]}}}
+    rows = [{"type": "edit", "ns": 0, "rcid": 1}, {"type": "new", "ns": 0, "rcid": 2}]
+
+    def responses(self, *data):
+        self.session.post.reset_mock()
+        self.session.post.side_effect = [Mock(status_code=200, json=Mock(return_value=d)) for d in data]
+
+    async def test_counts_scope_and_continuation(self):
+        for rows, continuation in (([], {}), (self.rows, {"continue": {"rccontinue": "next"}}), (self.rows, {"query-continue": {"recentchanges": {"rcstart": "next"}}})):
+            with self.subTest(rows=rows, continuation=continuation), patch.object(cu_stats, "PATROL_NAMESPACES", (0,)), patch.object(cu_stats, "PATROL_LIMIT", 10):
+                self.responses(self.base, WikiLoginCheck.short, {"query": {"recentchanges": rows}, **continuation})
+                stats = await cu_stats.fetch_wiki_stats()
+                self.assertEqual(stats.patrol.changes, len(rows))
+                self.assertEqual(stats.patrol.new_pages, len(rows) // 2)
+                self.assertEqual(stats.patrol.has_more, bool(continuation))
+                self.assertEqual(self.session.post.await_count, 3)
+                params = self.session.post.call_args.kwargs["data"]
+                self.assertEqual((params["rcshow"], params["rctype"], params["rcnamespace"], params["rclimit"]), ("!patrolled", "edit|new", "0", 10))
+                text = cu_stats.format_wiki_stats(stats)
+                self.assertIn("命名空间 (0,)", text)
+                self.assertIn("不是历史累计", text)
+                self.assertEqual("其中新建也仅限已读部分" in text, bool(continuation))
+
+    async def test_capabilities_and_optional_userinfo_warning(self):
+        for user, kind in (({"id": 0, "anon": "", "rights": ["read"]}, "permission"), ({"id": 1, "name": "Bot", "rights": []}, "permission"), ({"id": 1, "name": "Bot"}, "unknown"), ({}, "unknown")):
+            self.responses({"query": {"statistics": {"pages": 12}, "userinfo": user}}, WikiLoginCheck.short)
+            stats = await cu_stats.fetch_wiki_stats()
+            self.assertEqual(stats.patrol_error.kind, kind)
+            self.assertEqual(self.session.post.await_count, 2)
+        self.responses({**self.base, "warnings": {"userinfo": {"*": "unavailable"}}}, WikiLoginCheck.short)
+        stats = await cu_stats.fetch_wiki_stats()
+        self.assertEqual(stats.identity.state, "unknown")
+        self.assertEqual(stats.statistics["pages"], 12)
+        self.assertEqual(stats.patrol_error.kind, "unknown")
+
+    async def test_independent_failures_and_invalid_rows(self):
+        self.responses(self.base, {"error": {"code": "unknown_list"}}, {"query": {"recentchanges": self.rows}})
+        stats = await cu_stats.fetch_wiki_stats()
+        self.assertEqual(stats.short_error.kind, "unsupported")
+        self.assertEqual(stats.patrol.changes, 2)
+        for data, kind in (({"error": {"code": "permissiondenied"}}, "permission"), ({"query": {"recentchanges": []}, "warnings": {"recentchanges": {"*": "ignored filter"}}}, "warning"), ({"query": {}}, "response"), ({"query": {"recentchanges": self.rows * 2}}, "response"), ({"query": {"recentchanges": [{"type": [], "rcid": 1, "ns": 0}]}}, "response")):
+            self.responses(self.base, WikiLoginCheck.short, data)
+            stats = await cu_stats.fetch_wiki_stats()
+            self.assertEqual(stats.short_pages, 0)
+            self.assertIsNone(stats.patrol)
+            self.assertEqual(stats.patrol_error.kind, kind)
+
+    async def test_invalid_configuration_and_namespace_mismatch(self):
+        for name, value in (("PATROL_LIMIT", 0), ("PATROL_LIMIT", 501), ("PATROL_LIMIT", True), ("PATROL_NAMESPACES", ()), ("PATROL_NAMESPACES", [-1]), ("PATROL_NAMESPACES", (False,))):
+            with patch.object(cu_stats, name, value):
+                self.responses(self.base, WikiLoginCheck.short)
+                stats = await cu_stats.fetch_wiki_stats()
+                self.assertEqual(stats.patrol_error.kind, "configuration")
+                self.assertEqual(self.session.post.await_count, 2)
+        with patch.object(cu_stats, "PATROL_NAMESPACES", (10,)):
+            self.responses(self.base, WikiLoginCheck.short, {"query": {"recentchanges": self.rows}})
+            self.assertEqual((await cu_stats.fetch_wiki_stats()).patrol_error.kind, "response")
+
+    async def test_full_authenticated_budget_and_lost_session(self):
+        base = {"query": {"statistics": {"pages": 12}, "userinfo": {"id": 1, "name": "Bot", "rights": ["patrol"]}}}
+        auth = [WikiLoginCheck.token, {"login": {"result": "Aborted", "reason": "use clientlogin"}}, {"clientlogin": {"status": "UI", "requests": [{"id": "MediaWiki:skipReset"}]}}, {"clientlogin": {"status": "PASS", "username": "Bot"}}]
+        with patch.object(cu_stats, "_credentials", return_value=("Bot", "secret")):
+            self.responses(*auth, base, WikiLoginCheck.short, {"query": {"recentchanges": self.rows}})
+            stats = await cu_stats.fetch_wiki_stats()
+            self.assertEqual(self.session.post.await_count, 7)
+            self.assertEqual(stats.patrol.changes, 2)
+            self.assertEqual(self.session.post.call_args.kwargs["data"]["assertuser"], "Bot")
+            self.responses(*auth, base, {"error": {"code": "assertuserfailed"}})
+            stats = await cu_stats.fetch_wiki_stats()
+            self.assertEqual(stats.patrol_error.kind, "authentication")
+            self.assertEqual(self.session.post.await_count, 6)
+            self.responses(*auth, {"query": {"statistics": {"pages": 12}}}, WikiLoginCheck.short)
+            stats = await cu_stats.fetch_wiki_stats()
+            self.assertEqual(stats.statistics["pages"], 12)
+            self.assertEqual(stats.identity.state, "unknown")
+            self.assertEqual(stats.patrol_error.kind, "unknown")
+        self.responses(self.base, WikiLoginCheck.short)
+        with patch.object(cu_stats, "monotonic", side_effect=[0, 0, 0, 61]):
+            stats = await cu_stats.fetch_wiki_stats()
+        self.assertEqual(stats.short_pages, 0)
+        self.assertEqual(stats.patrol_error.kind, "timeout")
+        self.assertEqual(self.session.post.await_count, 2)
+
+
 if __name__ == "__main__":
     unittest.main()
