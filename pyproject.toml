@@ -1,0 +1,20 @@
+[project]
+name = "cuwikibot"
+version = "0.1.0"
+description = "QQ bot for querying Unknown Casualties Wiki progress"
+requires-python = ">=3.10"
+dependencies = [
+    "aiohttp==3.8.6",
+    "colorama==0.4.6",
+    "colorlog==6.7.0",
+    "curl-cffi>=0.16.3",
+    "fastapi==0.103.1",
+    "flask==2.3.3",
+    "pydantic==2.4.2",
+    "pynacl>=1.6.2",
+    "python-dotenv==1.0.0",
+    "requests==2.31.0",
+    "schedule==1.2.0",
+    "uvicorn==0.23.2",
+    "websockets==11.0.3",
+]
