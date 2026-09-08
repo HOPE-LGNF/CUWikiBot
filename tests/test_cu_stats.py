@@ -1,12 +1,20 @@
 """无需 Wiki 或 QQ 凭据的最小回归检查：uv run python -m unittest discover -s tests。"""
 
+import asyncio
+import json
 import unittest
+from time import monotonic
 from unittest.mock import AsyncMock, Mock, patch
 
 from plugins import cu_stats
 
 
 class WikiStatsCheck(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        credentials = patch.object(cu_stats, "_credentials", return_value=("", ""))
+        credentials.start()
+        self.addCleanup(credentials.stop)
+
     async def test_query_and_reply(self):
         def response(data, status=200):
             return Mock(status_code=status, json=Mock(return_value=data))
@@ -23,7 +31,7 @@ class WikiStatsCheck(unittest.IsolatedAsyncioTestCase):
             stats = await cu_stats.fetch_wiki_stats()
             factory.assert_called_once_with(impersonate="chrome131")
         self.assertEqual(session.post.await_count, 2)
-        self.assertEqual(session.post.call_args_list[0].kwargs["data"]["meta"], "siteinfo")
+        self.assertEqual(session.post.call_args_list[0].kwargs["data"]["meta"], "siteinfo|userinfo")
         self.assertEqual(session.post.call_args_list[1].kwargs["data"]["qppage"], "Shortpages")
         self.assertEqual(stats.short_pages, 1)
         self.assertTrue(stats.short_has_more)
@@ -77,6 +85,112 @@ class WikiStatsCheck(unittest.IsolatedAsyncioTestCase):
         # 登录响应不含 query，结构检查必须属于调用方。
         session.post = AsyncMock(return_value=response({"login": {"result": "Success"}}))
         self.assertIn("login", await cu_stats._api_request(session, action="login"))
+
+
+class WikiLoginCheck(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        credentials = patch.object(cu_stats, "_credentials", return_value=("Bot", "secret-password"))
+        credentials.start()
+        self.addCleanup(credentials.stop)
+        self.session = AsyncMock()
+        factory = patch.object(cu_stats.curl_requests, "AsyncSession")
+        factory.start().return_value.__aenter__.return_value = self.session
+        self.addCleanup(factory.stop)
+
+    def responses(self, *data):
+        self.session.post.side_effect = [Mock(status_code=200, json=Mock(return_value=d)) for d in data]
+
+    token = {"query": {"tokens": {"logintoken": "secret-token"}}}
+    base = {"query": {"statistics": {"pages": 12}, "userinfo": {"id": 1, "name": "Bot", "rights": ["read"]}}}
+    short = {"query": {"querypage": {"results": []}}}
+
+    async def test_login_and_guards(self):
+        self.responses(self.token, {"login": {"result": "Success", "lgusername": "Bot"}}, self.base, self.short)
+        stats = await cu_stats.fetch_wiki_stats()
+        self.assertEqual(stats.identity.state, "authenticated")
+        self.assertEqual(self.session.post.await_count, 4)
+        for call in self.session.post.call_args_list[2:]:
+            self.assertEqual(call.kwargs["data"]["assert"], "user")
+            self.assertEqual(call.kwargs["data"]["assertuser"], "Bot")
+        self.assertNotIn("Bot", repr(stats.identity))
+
+    async def test_fallback_and_bounded_interaction(self):
+        fallback = {"login": {"result": "Aborted", "reason": "use clientlogin"}}
+        reset = {"clientlogin": {"status": "UI", "requests": [{"id": "MediaWiki:skipReset"}]}}
+        self.responses(self.token, fallback, reset, {"clientlogin": {"status": "PASS", "username": "Bot"}}, self.base, self.short)
+        self.assertIsNone((await cu_stats.fetch_wiki_stats()).auth_error)
+        self.assertEqual(self.session.post.await_count, 6)
+        self.assertEqual(self.session.post.call_args_list[3].kwargs["data"]["skipReset"], "1")
+
+        for requests in ([], [{"id": "MediaWiki:skipReset"}, {"id": "2FA"}]):
+            self.responses(self.token, fallback, {"clientlogin": {"status": "UI", "requests": requests}})
+            with self.assertRaises(cu_stats.WikiApiError) as caught:
+                await cu_stats._login(self.session, "Bot", "secret-password", monotonic() + 60)
+            self.assertEqual(caught.exception.kind, "interaction")
+
+    async def test_failed_login_keeps_public_stats(self):
+        anonymous = {"query": {"statistics": {"pages": 12}, "userinfo": {"id": 0, "anon": "", "name": "192.0.2.1", "rights": ["read"]}}}
+        for result in ("Failed", "NeedToken"):
+            self.responses(self.token, {"login": {"result": result, "reason": "secret-password secret-token"}}, anonymous, self.short)
+            stats = await cu_stats.fetch_wiki_stats()
+            self.assertEqual(stats.auth_error.kind, "authentication")
+            self.assertEqual(stats.identity.state, "anonymous")
+            text = cu_stats.format_wiki_stats(stats)
+            self.assertIn("登录未完成", text)
+            self.assertNotIn("secret", text)
+            self.assertNotIn("192.0.2.1", repr(stats))
+            self.assertNotIn("assert", self.session.post.call_args.kwargs["data"])
+
+    async def test_incomplete_config_and_identity_loss(self):
+        with patch.object(cu_stats, "_credentials", return_value=("Bot", "")):
+            self.responses(self.base, self.short)
+            self.assertEqual((await cu_stats.fetch_wiki_stats()).auth_error.kind, "configuration")
+            self.assertEqual(self.session.post.await_count, 2)
+        self.responses(self.token, {"login": {"result": "Success", "lgusername": "Bot"}}, {"error": {"code": "assertuserfailed"}})
+        reply = await cu_stats.WikiStatsPlugin().handle("")
+        self.assertIn("身份已失效", reply.text)
+
+    async def test_deadline_stops_requests_and_preserves_base(self):
+        with self.assertRaises(cu_stats.WikiApiError):
+            await cu_stats._api_request(self.session, deadline=monotonic() - 1)
+        self.session.post.assert_not_awaited()
+        async def slow_post(*args, **kwargs):
+            await asyncio.sleep(1)
+        self.session.post.side_effect = slow_post
+        with self.assertRaises(cu_stats.WikiApiError) as caught:
+            await cu_stats._api_request(self.session, deadline=monotonic() + .02)
+        self.assertEqual(caught.exception.kind, "timeout")
+        with patch.object(cu_stats, "_credentials", return_value=("", "")):
+            self.responses(self.base)
+            # 任务开始、基础请求尚有预算、短页面请求开始前耗尽。
+            with patch.object(cu_stats, "monotonic", side_effect=[0, 0, 61]):
+                stats = await cu_stats.fetch_wiki_stats()
+            self.assertEqual(stats.statistics["pages"], 12)
+            self.assertEqual(stats.short_error.kind, "timeout")
+
+
+class WikiCookieCheck(unittest.IsolatedAsyncioTestCase):
+    async def test_cookie_jar_covers_login_and_queries(self):
+        cookies = []
+        payloads = [WikiLoginCheck.token, {"login": {"result": "Success", "lgusername": "Bot"}}, WikiLoginCheck.base, WikiLoginCheck.short]
+        async def serve(reader, writer):
+            headers = (await reader.readuntil(b"\r\n\r\n")).decode()
+            length = next(int(line.split(":", 1)[1]) for line in headers.splitlines() if line.lower().startswith("content-length:"))
+            await reader.readexactly(length)
+            cookies.append(next((line for line in headers.splitlines() if line.lower().startswith("cookie:")), ""))
+            body = json.dumps(payloads[len(cookies) - 1]).encode()
+            cookie = "login=started" if len(cookies) == 1 else "identity=confirmed"
+            writer.write(f"HTTP/1.1 200 OK\r\nContent-Length: {len(body)}\r\nContent-Type: application/json\r\nSet-Cookie: {cookie}; Path=/\r\nConnection: close\r\n\r\n".encode() + body)
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+        async with await asyncio.start_server(serve, "127.0.0.1", 0) as server:
+            url = f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}/api.php"
+            with patch.object(cu_stats, "DEFAULT_API_URL", url), patch.object(cu_stats, "_credentials", return_value=("Bot", "secret")):
+                self.assertEqual((await cu_stats.fetch_wiki_stats()).identity.state, "authenticated")
+        self.assertEqual(len(cookies), 4)
+        self.assertIn("login=started", cookies[1])
+        self.assertTrue(all("identity=confirmed" in cookie for cookie in cookies[2:]))
 
 
 if __name__ == "__main__":

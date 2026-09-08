@@ -24,7 +24,7 @@ CUWikiBot 是一个基于 [HiklQQBot](https://github.com/kldhsh123/hiklqqbot/) �
 
 发送 `/wiki统计` 查询固定 Wiki，不接受自定义 URL。API 地址、站点名、指纹、超时和读取上限集中在 `plugins/cu_stats.py` 顶部，适合当前少量用户直接维护。
 
-Wiki 访问采用 `curl-cffi` 的 `chrome131` 浏览器指纹，通过同一个异步 Session 向 `/api.php` 发送 POST 请求并自动复用 Cookie。会话贯穿一次统计任务，结束后关闭；当前查询公开数据，无需 Wiki 登录。此方案不执行五秒盾的 JavaScript 验证，遇到 HTTP 错误或非 JSON 验证页面会报告失败，不能保证长期绕过防护。
+Wiki 访问采用 `curl-cffi` 的 `chrome131` 浏览器指纹，通过同一个异步 Session 向 `/api.php` 发送 POST 请求并自动复用 Cookie。会话贯穿一次统计任务，结束后关闭；公开查询无需登录，可在 `.env` 配置 `WIKI_USERNAME` 和 `WIKI_PASSWORD` 启用 Wiki 登录。这与 QQ 凭据无关。登录失败会明确提示，并继续尝试公开统计；不自动处理验证码、二次验证或外部登录跳转。单请求默认 15 秒，整个网络任务默认最多 60 秒，不自动重试。此方案不执行五秒盾的 JavaScript 验证，不能保证长期绕过防护。
 
 短页面最多读取首批 500 条，有后续时会明确提示；它不是 170 字节阈值的全站统计。`mwclient + mwparserfromhell` 的可行性、实测结果和暂缓引入理由也记录在架构文档中。
 

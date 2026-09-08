@@ -47,7 +47,7 @@ async with curl_requests.AsyncSession(impersonate="chrome131") as session:
 
 使用异步会话适配现有 QQ 事件循环；传输仍由 `curl-cffi` 完成。请求发往官方 `/api.php`，参数放在 POST 表单中。浏览器请求头交给指纹预设生成，避免原先 Chrome 118 User-Agent 与其他版本指纹不一致。
 
-Cookie 完全由 Session 的 Cookie Jar 保存和复用，不手工解析、不硬编码 `cf_clearance`，也不读取浏览器 Cookie。本次基础统计和短页面查询串行共用一个 Session；任务结束后关闭，不跨命令持久化 Cookie。当前只读公开统计，不登录 Wiki。
+Cookie 完全由 Session 的 Cookie Jar 保存和复用，不手工解析、不硬编码 `cf_clearance`，也不读取浏览器 Cookie。登录、基础统计和短页面查询串行共用一个 Session；任务结束后关闭，不跨命令持久化 Cookie。凭据来自本地 `.env` 或优先级更高的环境变量；均为空时匿名运行。
 
 这是降低触发防护概率的传输方式，不是 JavaScript challenge solver；也不保证一定能通过站点防护。固定指纹可能随站点规则变化而失效。收到 HTTP 错误或非 JSON 验证页面时记录失败，不反复尝试过盾。
 
@@ -61,7 +61,7 @@ Cookie 完全由 Session 的 Cookie Jar 保存和复用，不手工解析、不�
 | `REQUEST_TIMEOUT` | 每次请求 15 秒 |
 | `SHORT_PAGE_LIMIT` | 500 条，调整范围为 1–500 |
 
-一次命令最多两次 API 请求，不自动重试、不并行、不跟随重定向。Cookie 生命周期是一次统计任务；若将来需要登录后连续执行多个操作，再让整个操作任务共用一个会话，并补充身份校验。参考项目的登录回退、编辑和上传能力不属于当前业务。
+本阶段公开查询两次请求；登录最多增加四次：token、login、指定原因下的 clientlogin 回退、一次可跳过密码重置的继续请求。其他交互和 NeedToken 不重试。登录后基础统计合并 userinfo/rights，以规范用户名断言身份；后续认证查询继续携带 assert=user/assertuser。登录失败停止认证流程并明确降级到公开统计，不声称认证成功。请求串行、不跟随重定向，单请求默认 15 秒、整次网络任务默认 60 秒；预算耗尽停止新增请求并保留已读结果。
 
 ## 指标与失败行为
 
