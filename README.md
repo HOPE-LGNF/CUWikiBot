@@ -52,4 +52,17 @@ uv remove <package>
 
 部署已有锁文件的版本时可执行 `uv sync --locked`，确保环境与锁文件一致。
 
+## 开发检查
+
+普通 `uv sync` 会同时安装开发依赖中的 Ruff 和 ty。默认检查范围仅包含当前实际维护的业务模块 `plugins/cu_stats.py`：
+
+```bash
+uv run ruff format .
+uv run ruff check . --preview
+uv run ty check
+uv run python -m unittest discover -s tests
+```
+
+Ruff 和 ty 的范围及格式规则位于 `pyproject.toml`。VS Code 打开仓库后安装推荐的 Ruff 扩展，Python 文件会在保存时格式化；PyCharm 选择 `.venv` 作为项目解释器并启用 Ruff 插件，即会复用同一份配置。机器人框架计划替换，不纳入当前质量基线，因此暂未把全仓检查设为 pre-commit 门禁。
+
 原始 HiklQQBot 文档保存在 [Original_README.md](Original_README.md)。

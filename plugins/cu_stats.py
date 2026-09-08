@@ -76,28 +76,37 @@ async def fetch_wiki_stats() -> WikiStats | None:
             return None
         # 缺失或异常字段不能显示成 0，以免把未知数据当作真实统计。
         statistics = {
-            key: value for key, value in statistics.items()
+            key: value
+            for key, value in statistics.items()
             if key in {"pages", "edits", "users", "activeusers"}
-            and type(value) is int and value >= 0
+            and type(value) is int
+            and value >= 0
         }
         if not statistics:
             return None
 
         # ponytail: 仅取首批，超过 500 条时标注未读完；需要精确列表数再增加有界分页。
-        data = await _api_request(
-            session, list="querypage", qppage="Shortpages", qplimit=SHORT_PAGE_LIMIT,
+        short_data = await _api_request(
+            session,
+            list="querypage",
+            qppage="Shortpages",
+            qplimit=SHORT_PAGE_LIMIT,
         )
-        short = data["query"].get("querypage") if data is not None else None
+        if short_data is None:
+            return WikiStats(statistics, None)
+        short = short_data["query"].get("querypage")
         if not isinstance(short, dict) or not isinstance(short.get("results"), list):
             return WikiStats(statistics, None)
         results = short["results"]
-        if any(not isinstance(page, dict) or not isinstance(page.get("title"), str)
-               for page in results):
+        if any(
+            not isinstance(page, dict) or not isinstance(page.get("title"), str) for page in results
+        ):
             logger.warning("Wiki API 短页面列表条目无效")
             return WikiStats(statistics, None)
         return WikiStats(
-            statistics, len(results),
-            "continue" in data or "query-continue" in data,
+            statistics,
+            len(results),
+            "continue" in short_data or "query-continue" in short_data,
             "cached" in short,
         )
 
@@ -137,8 +146,9 @@ class WikiStatsPlugin(BasePlugin):
             display_name="Wiki统计",
         )
 
-    async def handle(self, params: str, user_id: str = None,
-                     group_openid: str = None, **kwargs) -> Reply:
+    async def handle(
+        self, params: str, user_id: str | None = None, group_openid: str | None = None, **kwargs
+    ) -> Reply:
         if params and params.strip():
             return Reply(text="请使用 /wiki统计；数据源由维护者在源码顶部配置。")
 
@@ -149,11 +159,19 @@ class WikiStatsPlugin(BasePlugin):
         keyboard = None
         # 当前框架可能取不到群用户 ID；此时省略按钮，避免生成 [None] 权限列表。
         if user_id:
-            keyboard = make_keyboard([make_button_row([make_command_button(
-                button_id="wiki_stats_refresh",
-                label="🔄 刷新",
-                command="/wiki统计",
-                style=1,
-                permission_user_ids=[user_id],
-            )])])
+            keyboard = make_keyboard(
+                [
+                    make_button_row(
+                        [
+                            make_command_button(
+                                button_id="wiki_stats_refresh",
+                                label="🔄 刷新",
+                                command="/wiki统计",
+                                style=1,
+                                permission_user_ids=[user_id],
+                            )
+                        ]
+                    )
+                ]
+            )
         return Reply(markdown=format_wiki_stats(stats), keyboard=keyboard)

@@ -27,7 +27,9 @@ env/
 
 # 开发工具
 .idea/
-.vscode/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
 *.swp
 *.swo
 
