@@ -113,6 +113,30 @@ class WikiStats:
     patrol_namespaces: tuple[int, ...] | None = None
 
 
+def _is_login_advisory(warnings: object) -> bool:
+    """仅接受实测的旧式登录弃用提示；仍由 _login 检查实际登录结果。"""
+    known = {
+        "main": (
+            "Subscribe to the mediawiki-api-announce mailing list at "
+            "<https://lists.wikimedia.org/postorius/lists/mediawiki-api-announce.lists.wikimedia.org/> "
+            "for notice of API deprecations and breaking changes."
+        ),
+        "login": (
+            'Main-account login via "action=login" is deprecated and may stop working without '
+            'warning. To continue login with "action=login", see [[Special:BotPasswords]]. '
+            'To safely continue using main-account login, see "action=clientlogin".'
+        ),
+    }
+    return (
+        isinstance(warnings, dict)
+        and bool(warnings)
+        and all(
+            module in known and warning == {"*": known[module]}
+            for module, warning in warnings.items()
+        )
+    )
+
+
 async def _api_request(
     session: curl_requests.AsyncSession,
     *,
@@ -164,7 +188,8 @@ async def _api_request(
     # 合并查询的 userinfo 警告只使身份未知；其他警告可能改变统计语义，不能忽略。
     warnings = data.get("warnings")
     if warnings and not (
-        allow_userinfo_warning and isinstance(warnings, dict) and set(warnings) == {"userinfo"}
+        (allow_userinfo_warning and isinstance(warnings, dict) and set(warnings) == {"userinfo"})
+        or (params.get("action") == "login" and _is_login_advisory(warnings))
     ):
         raise WikiApiError(
             "warning", "API 返回警告，无法确认查询条件是否生效", status=response.status_code
@@ -284,7 +309,8 @@ def _patrol_params() -> dict:
         "list": "recentchanges",
         "rcshow": "!patrolled",
         "rctype": "edit|new",
-        "rcprop": "ids|flags",
+        # title 同时返回 ns，下面需要用它校验命名空间范围。
+        "rcprop": "ids|flags|title",
         "rclimit": PATROL_LIMIT,
     }
     if PATROL_NAMESPACES is not None:
@@ -502,10 +528,18 @@ class WikiStatsPlugin(BasePlugin):
             )
             return Reply(text=f"❌ 无法获取 Wiki 统计：{error}")
 
-        for error in (stats.auth_error, stats.short_error, stats.patrol_error):
+        for stage, error in (
+            ("login", stats.auth_error),
+            ("shortpages", stats.short_error),
+            ("patrol", stats.patrol_error),
+        ):
             if error is not None:
                 logger.warning(
-                    "Wiki 功能降级 kind=%s code=%s status=%s", error.kind, error.code, error.status
+                    "Wiki 功能降级 stage=%s kind=%s code=%s status=%s",
+                    stage,
+                    error.kind,
+                    error.code,
+                    error.status,
                 )
 
         keyboard = None

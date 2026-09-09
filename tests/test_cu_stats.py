@@ -104,6 +104,64 @@ class WikiLoginCheck(unittest.IsolatedAsyncioTestCase):
     base = {"query": {"statistics": {"pages": 12}, "userinfo": {"id": 1, "name": "Bot", "rights": ["read"]}}}
     short = {"query": {"querypage": {"results": []}}}
 
+    # 目标 Wiki 实际返回的警告；不能使已成功的登录降级并跳过巡查。
+    login_warnings = {
+        "main": {
+            "*": (
+                "Subscribe to the mediawiki-api-announce mailing list at "
+                "<https://lists.wikimedia.org/postorius/lists/mediawiki-api-announce.lists.wikimedia.org/> "
+                "for notice of API deprecations and breaking changes."
+            )
+        },
+        "login": {
+            "*": (
+                'Main-account login via "action=login" is deprecated and may stop working without '
+                'warning. To continue login with "action=login", see [[Special:BotPasswords]]. '
+                'To safely continue using main-account login, see "action=clientlogin".'
+            )
+        },
+    }
+
+    async def test_login_advisory_preserves_patrol_and_guards(self):
+        self.responses(
+            self.token,
+            {"login": {"result": "Success", "lgusername": "Bot"}, "warnings": self.login_warnings},
+            {
+                "query": {
+                    "statistics": {"pages": 12},
+                    "userinfo": {"id": 1, "name": "Bot", "rights": ["patrol"]},
+                }
+            },
+            self.short,
+            {"query": {"recentchanges": [{"type": "new", "ns": 0, "rcid": 1}]}},
+        )
+        stats = await cu_stats.fetch_wiki_stats()
+        self.assertIsNone(stats.auth_error)
+        self.assertEqual(stats.patrol, cu_stats.PatrolStats(1, 1, False))
+        self.assertNotIn("登录未完成", cu_stats.format_wiki_stats(stats))
+        for call in self.session.post.call_args_list[2:]:
+            self.assertEqual(call.kwargs["data"]["assertuser"], "Bot")
+
+    async def test_login_advisory_does_not_hide_other_warnings_or_failure(self):
+        for action, warnings in (
+            ("query", self.login_warnings),
+            ("login", {**self.login_warnings, "other": {"*": "ignored parameter"}}),
+            ("login", {**self.login_warnings, "login": {"*": "unknown warning"}}),
+            ("login", {**self.login_warnings, "main": {"*": "ignored parameter"}}),
+        ):
+            with self.subTest(action=action, warnings=warnings):
+                self.responses({"warnings": warnings})
+                with self.assertRaises(cu_stats.WikiApiError) as caught:
+                    await cu_stats._api_request(self.session, action=action)
+                self.assertEqual(caught.exception.kind, "warning")
+        self.responses(
+            self.token,
+            {"login": {"result": "Failed"}, "warnings": self.login_warnings},
+        )
+        with self.assertRaises(cu_stats.WikiApiError) as caught:
+            await cu_stats._login(self.session, "Bot", "secret-password", monotonic() + 60)
+        self.assertEqual(caught.exception.kind, "authentication")
+
     async def test_login_and_guards(self):
         self.responses(self.token, {"login": {"result": "Success", "lgusername": "Bot"}}, self.base, self.short)
         stats = await cu_stats.fetch_wiki_stats()
@@ -115,7 +173,7 @@ class WikiLoginCheck(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Bot", repr(stats.identity))
 
     async def test_fallback_and_bounded_interaction(self):
-        fallback = {"login": {"result": "Aborted", "reason": "use clientlogin"}}
+        fallback = {"login": {"result": "Aborted", "reason": "use clientlogin"}, "warnings": self.login_warnings}
         reset = {"clientlogin": {"status": "UI", "requests": [{"id": "MediaWiki:skipReset"}]}}
         self.responses(self.token, fallback, reset, {"clientlogin": {"status": "PASS", "username": "Bot"}}, self.base, self.short)
         self.assertIsNone((await cu_stats.fetch_wiki_stats()).auth_error)
@@ -238,6 +296,25 @@ class WikiPatrolCheck(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stats.identity.state, "unknown")
         self.assertEqual(stats.statistics["pages"], 12)
         self.assertEqual(stats.patrol_error.kind, "unknown")
+
+    async def test_patrol_requests_namespace_field(self):
+        async def respond(_url, *, data, **kwargs):
+            if data.get("list") == "recentchanges":
+                # MediaWiki 仅在 rcprop 包含 title 时返回 ns。
+                row = {"type": "edit", "rcid": 1}
+                if "title" in data["rcprop"].split("|"):
+                    row.update(ns=0, title="Example")
+                payload = {"query": {"recentchanges": [row]}}
+            elif data.get("list") == "querypage":
+                payload = WikiLoginCheck.short
+            else:
+                payload = self.base
+            return Mock(status_code=200, json=Mock(return_value=payload))
+
+        self.session.post.side_effect = respond
+        stats = await cu_stats.fetch_wiki_stats()
+        self.assertIsNone(stats.patrol_error)
+        self.assertEqual(stats.patrol, cu_stats.PatrolStats(1, 0, False))
 
     async def test_independent_failures_and_invalid_rows(self):
         self.responses(self.base, {"error": {"code": "unknown_list"}}, {"query": {"recentchanges": self.rows}})
